@@ -1,0 +1,3 @@
+'use strict';
+// WebGPU capability bridge. v0.19 keeps the proven WebGL2 renderer active; this acquires a high-performance WebGPU device when available so renderer modules can migrate incrementally without breaking unsupported devices.
+globalThis.DorukGPUBridge={available:!!navigator.gpu,ready:false,adapter:null,device:null,activeRenderer:'WebGL2',async init(){if(!navigator.gpu)return false;try{this.adapter=await navigator.gpu.requestAdapter({powerPreference:'high-performance'});if(!this.adapter)return false;this.device=await this.adapter.requestDevice();this.ready=true;this.activeRenderer='WebGL2 + WebGPU-ready';return true;}catch(error){console.warn('WebGPU unavailable; WebGL2 stays active.',error);return false;}},label(){return this.activeRenderer;}};

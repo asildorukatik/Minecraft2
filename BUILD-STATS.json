@@ -1,0 +1,15 @@
+{
+  "standalone_bytes": 35598990,
+  "index_bytes": 123483,
+  "game_js_bytes": 835806,
+  "world_worker_bytes": 54973,
+  "asset_count": 393,
+  "image_count": 179,
+  "audio_count": 214,
+  "asset_bytes": 24219082,
+  "hybrid_version": "0.22.3",
+  "file_compat_bytes": 2694380,
+  "file_compat_image_count": 179,
+  "double_click_supported": true,
+  "project_bytes": 28118291
+}
