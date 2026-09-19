@@ -476,8 +476,8 @@ const SEEDED_ROTATION_BLOCKS=new Set([
 ]);
 function seededTextureFaceRotates(id,kind){if(id===BLOCK.GRASS)return kind==='top'||kind==='bottom';return SEEDED_ROTATION_BLOCKS.has(id);}
 function seededTextureQuarterTurn(id,kind,x,y,z){if(!seededTextureFaceRotates(id,kind))return 0;let h=(seed|0)^Math.imul((x|0),0x1f123bb5)^Math.imul((y|0),0x5f356495)^Math.imul((z|0),0x6c8e9cf5)^Math.imul((id|0),0x27d4eb2d);h^=h>>>15;h=Math.imul(h,0x2c1b3c6d);h^=h>>>12;h=Math.imul(h,0x297a2d39);h^=h>>>15;return h&3;}
-function pushQuad(arr,verts,uv,shade,ox,oy,oz,quarterTurns=0){const[u0,v0,u1,v1]=uv,base=[[u0,v1],[u0,v0],[u1,v0],[u1,v1]],q=quarterTurns&3,uvv=q?base.map((_,i)=>base[(i+q)&3]):base,order=[0,1,2,0,2,3];for(const i of order){const p=verts[i],t=uvv[i];arr.push(p[0]+ox,p[1]+oy,p[2]+oz,t[0],t[1],shade);}}
-function pushCobwebMesh(arr,x,y,z){const uv=tileUV(TILES.get(BLOCK.COBWEB).all),planes=[[[0,0,0],[0,1,0],[1,1,1],[1,0,1]],[[1,0,0],[1,1,0],[0,1,1],[0,0,1]],[[0,.5,0],[0,.5,1],[1,.5,1],[1,.5,0]]];for(const plane of planes){pushQuad(arr,plane,uv,1,x,y,z);pushQuad(arr,[plane[3],plane[2],plane[1],plane[0]],uv,1,x,y,z);}}
+function pushWorldQuad(arr,verts,uv,shade,sky,ox,oy,oz,quarterTurns=0){const[u0,v0,u1,v1]=uv,base=[[u0,v1],[u0,v0],[u1,v0],[u1,v1]],q=quarterTurns&3,uvv=q?base.map((_,i)=>base[(i+q)&3]):base,order=[0,1,2,0,2,3];for(const i of order){const p=verts[i],t=uvv[i];arr.push(p[0]+ox,p[1]+oy,p[2]+oz,t[0],t[1],shade,sky);}}
+function pushCobwebMesh(arr,x,y,z){const uv=tileUV(TILES.get(BLOCK.COBWEB).all),sky=faceSkyLevel(x,y,z),planes=[[[0,0,0],[0,1,0],[1,1,1],[1,0,1]],[[1,0,0],[1,1,0],[0,1,1],[0,0,1]],[[0,.5,0],[0,.5,1],[1,.5,1],[1,.5,0]]];for(const plane of planes){pushWorldQuad(arr,plane,uv,1,sky,x,y,z);pushWorldQuad(arr,[plane[3],plane[2],plane[1],plane[0]],uv,1,sky,x,y,z);}}
 const SHORT_BLOCK_HEIGHTS=new Map([[BLOCK.ENCHANTING_TABLE,12/16],[BLOCK.END_PORTAL_FRAME,13/16]]),FLOW_HEIGHTS=[1,.84,.68,.52,.36,.20];
 function blockModelHeight(id){const stage=Number(TILES.get(id)?.flowStage)||0;return stage?FLOW_HEIGHTS[Math.max(1,Math.min(5,stage))]:SHORT_BLOCK_HEIGHTS.get(id)||1;}
 function faceVertsForBlock(id,face){const h=blockModelHeight(id);if(h===1)return face.v;return face.v.map(v=>[v[0],v[1]===1?h:v[1],v[2]]);}
@@ -485,6 +485,20 @@ function faceUVForBlock(id,face,x,z){const uv=tileUV(blockTile(id,face.kind,x,z)
 const isCutout=b=>!!TILES.get(b)?.cutout;
 const isFluid=b=>!!TILES.get(b)?.fluid;
 const isOpaque=b=>b!==BLOCK.AIR&&!isFluid(b)&&!isCutout(b)&&!TILES.get(b)?.entityOnly;
+let skyColumnBlockerCache=new Map(),skyFaceLevelCache=new Map();
+function resetSkyLightCaches(){skyColumnBlockerCache=new Map();skyFaceLevelCache=new Map();}
+function skyLightPassable(id){const d=TILES.get(id);return id===BLOCK.AIR||isFluid(id)||isCutout(id)||!!d?.entityOnly||!!d?.passable;}
+function skyColumnKey(x,z){return insideAbs(x,0,z)?((z-originZ)*worldW+(x-originX)):`${x},${z}`;}
+function skyCellKey(x,y,z){return insideAbs(x,y,z)?idxLocal(x-originX,y,z-originZ):`${x},${y},${z}`;}
+function highestSkyBlockerY(x,z){const key=skyColumnKey(x,z);if(skyColumnBlockerCache.has(key))return skyColumnBlockerCache.get(key);let blocker=-1;for(let yy=WORLD_H-1;yy>=0;yy--){if(!skyLightPassable(getBlockAbs(x,yy,z))){blocker=yy;break;}}skyColumnBlockerCache.set(key,blocker);return blocker;}
+function directSkyAt(x,y,z){return dimension==='overworld'&&y>highestSkyBlockerY(x,z);}
+function faceSkyLevel(x,y,z){
+  if(dimension!=='overworld')return 1;if(y<0||y>=WORLD_H)return 1;const key=skyCellKey(x,y,z);if(skyFaceLevelCache.has(key))return skyFaceLevelCache.get(key);
+  if(!skyLightPassable(getBlockAbs(x,y,z))){skyFaceLevelCache.set(key,0);return 0;}if(directSkyAt(x,y,z)){skyFaceLevelCache.set(key,1);return 1;}
+  const queue=[[x,y,z,0]],seen=new Set([key]),dirs=[[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];let result=0;
+  for(let qi=0;qi<queue.length;qi++){const[cx,cy,cz,d]=queue[qi];if(d>=3)continue;for(const dir of dirs){const nx=cx+dir[0],ny=cy+dir[1],nz=cz+dir[2],nd=d+1;if(ny<0||ny>=WORLD_H)continue;const nk=skyCellKey(nx,ny,nz);if(seen.has(nk)||!skyLightPassable(getBlockAbs(nx,ny,nz)))continue;seen.add(nk);if(directSkyAt(nx,ny,nz)){result=(4-nd)/4;qi=queue.length;break;}queue.push([nx,ny,nz,nd]);}}
+  skyFaceLevelCache.set(key,result);return result;
+}
 const CHORUS_FACE_DATA=[
   {kind:'north',shade:.82,v:[[.22,0,.22],[.22,1,.22],[.78,1,.22],[.78,0,.22]]},
   {kind:'south',shade:.9,v:[[.78,0,.78],[.78,1,.78],[.22,1,.78],[.22,0,.78]]},
@@ -494,6 +508,7 @@ const CHORUS_FACE_DATA=[
   {kind:'bottom',shade:.66,v:[[.22,0,.78],[.22,0,.22],[.78,0,.22],[.78,0,.78]]}
 ];
 function buildMesh(){
+  resetSkyLightCaches();
   const chunks=[],entityBlocks=[],lightBlocks=[],minCx=Math.floor(originX/CHUNK_SIZE),maxCx=Math.floor((originX+worldW-1)/CHUNK_SIZE),minCz=Math.floor(originZ/CHUNK_SIZE),maxCz=Math.floor((originZ+worldD-1)/CHUNK_SIZE),total=(maxCx-minCx+1)*(maxCz-minCz+1);let completed=0;
   for(let cz=minCz;cz<=maxCz;cz++)for(let cx=minCx;cx<=maxCx;cx++){
     const shouldMesh=!meshChunkFilter||meshChunkFilter.has(`${cx},${cz}`),solid=[],cutouts=[],leafInstances=[],water=[],shell=new Set(),x0=Math.max(originX,cx*CHUNK_SIZE),x1=Math.min(originX+worldW,(cx+1)*CHUNK_SIZE),z0=Math.max(originZ,cz*CHUNK_SIZE),z1=Math.min(originZ+worldD,(cz+1)*CHUNK_SIZE);
@@ -511,7 +526,7 @@ function buildMesh(){
           else if(isCutout(b))visible=n!==b&&(!isOpaque(n)||n===BLOCK.AIR);
           else visible=n===BLOCK.AIR||isFluid(n)||isCutout(n)||TILES.get(n)?.entityOnly;
           if(visible){
-            pushQuad(target,faceVertsForBlock(b,f),faceUVForBlock(b,f,x,z),f.shade,x,y,z,seededTextureQuarterTurn(b,f.kind,x,y,z));
+            pushWorldQuad(target,faceVertsForBlock(b,f),faceUVForBlock(b,f,x,z),f.shade,faceSkyLevel(x+f.d[0],y+f.d[1],z+f.d[2]),x,y,z,seededTextureQuarterTurn(b,f.kind,x,y,z));
             // Keep the visible block plus two solid blocks behind that exposed face in
             // a compact CPU shell. Local edits can remesh this frontier instead of
             // scanning all 200 vertical blocks in the chunk.

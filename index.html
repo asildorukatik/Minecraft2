@@ -6,7 +6,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
   <meta name="theme-color" content="#1b211f">
-  <title>DorukCraft Mobile v0.22.3</title>
+  <title>DorukCraft Mobile v0.22.5.1</title>
   <meta name="theme-color" content="#111318">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
@@ -396,6 +396,7 @@ body[data-input-mode="controller"] .inventoryCursor:not(.hidden){position:fixed!
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <script src="./webgpu-bridge.js"></script>
+  <script src="./js/lighting-engine.js"></script>
 
 <style id="controllerPopupClosePolicy">
 body[data-input-mode="controller"] #closeInventoryBtn,
@@ -447,7 +448,7 @@ body[data-input-mode="controller"] .villagerTradeClose{display:none!important}
         <button id="editCharacterBtn" class="pixelButton compact">Edit Character</button>
       </aside>
     </div>
-    <div class="titleFooter leftFooter"><b>v0.22.2 alpha</b><br>©DorukGames</div>
+    <div class="titleFooter leftFooter"><b>v0.22.5.1 alpha</b><br>©DorukGames</div>
     <div class="titleFooter rightFooter">
       <button id="titleControlsBtn" class="squareMenuButton" aria-label="Controls">?</button>
       <button id="titleSettingsBtn" class="squareMenuButton suppliedIconButton" aria-label="Settings"><img src="./assets/images/2e24025fbc237c421b81.png" alt=""></button>
@@ -594,6 +595,8 @@ body[data-input-mode="controller"] .villagerTradeClose{display:none!important}
             <label class="optionSlider">Field of View: <b id="fovValue">70°</b><input id="fovSlider" type="range" min="50" max="100" step="1" value="70"></label>
             <button id="fovEffectsBtn" class="pixelButton">☐ Disable FOV Effects</button>
             <button id="shadersBtn" class="pixelButton">☐ Enhanced Shaders + Sun Shadows</button>
+            <button id="lightingEngineBtn" class="pixelButton">Lighting Engine: Auto (Recommended)</button>
+            <p id="lightingEngineStatus" class="modeDescription">Active: detecting best lighting backend…</p>
             <label class="optionSlider">Shadow Distance: <b id="shadowDistanceValue">32 blocks</b><input id="shadowDistanceSlider" type="range" min="16" max="48" step="8" value="32"></label>
             <button id="weatherParticlesBtn" class="pixelButton">☑ Weather Particles</button>
             <p id="shaderWarning" class="warningText hidden">Directional sun shadows render blocks into a real depth map. Lower shadow distance if a mobile device slows down.</p>

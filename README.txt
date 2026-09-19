@@ -1,4 +1,4 @@
-DorukCraft Optimized Hybrid PWA v0.22.3
+DorukCraft Optimized Hybrid PWA v0.22.5
 ========================================
 
 DOUBLE-CLICK MODE
@@ -27,5 +27,19 @@ Structure
 - doruk_fast.wasm: hosted WASM helper
 - sw.js: hosted/offline PWA cache
 
-The actual renderer is WebGL2. WebGPU is still capability scaffolding, and the WASM module
-is a small helper rather than the entire engine.
+LIGHTING ENGINE
+---------------
+DorukCraft v0.22.5 uses one Minecraft-style voxel light volume for world rendering:
+- skylight 0-15 and block light 0-15
+- normal torches emit level 14
+- glowstone/lava/fire/jack-o-lantern emit level 15
+- redstone torches emit level 7
+- light falls by one level per traversed voxel and opaque blocks stop propagation
+- terrain and dynamic world geometry (beds, chests, doors, mobs, dropped items, etc.) sample the same light texture
+
+Lighting Engine can be Auto, CPU / WebGL2, or GPU / WebGPU. Auto benchmarks the CPU
+implementation against WebGPU compute when WebGPU is available and caches the faster
+choice for that device. GPU lighting failure falls back to CPU. The world renderer itself
+remains WebGL2 in this build; WebGPU accelerates voxel-light computation only.
+
+The WASM module remains a small helper rather than the entire engine.

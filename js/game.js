@@ -82,6 +82,8 @@ const EMBEDDED_CATEGORY_ICONS={'icon_Materials.png': './assets/images/acd9c23f5f
   const fovEffectsBtn = $('fovEffectsBtn');
   const chunkStatus = $('chunkStatus');
   const shadersBtn = $('shadersBtn');
+  const lightingEngineBtn = $('lightingEngineBtn');
+  const lightingEngineStatus = $('lightingEngineStatus');
   const shaderWarning = $('shaderWarning');
   const offhandSlotEl = $('offhandSlot');
   const firstPersonHeld = $('firstPersonHeld');
@@ -180,7 +182,7 @@ const EMBEDDED_CATEGORY_ICONS={'icon_Materials.png': './assets/images/acd9c23f5f
   const CHARACTER_LIBRARY_KEY = 'dorukcraft-character-library-v014';
   const ADDON_KEY = 'dorukcraft-addons-v011';
   const CUSTOM_TITLE_KEY = 'dorukcraft-custom-title-library-v015';
-  const BUILD_VERSION = '0.22.3';
+  const BUILD_VERSION = '0.22.5.1';
   // v0.17.0 controller/local multiplayer support: standard Gamepad mapping for DualShock 4,
   // DualSense and Xbox pads; controller aiming always uses the centered PC crosshair.
   // Controller UI is focus-owned: every active screen gets an automatic default focus,
@@ -757,6 +759,7 @@ const EMBEDDED_CATEGORY_ICONS={'icon_Materials.png': './assets/images/acd9c23f5f
   let uMVP, uCam, uTexture, uAlpha, uAlphaCutoff, uFogColor, uFogMix, uFogNear, uFogFar, uRedFlash, uTint;
   let uTime, uWave, uSkyLight, uEnhanced, uUnderwater, uLightMVP, uShadowMap, uUseShadows;
   let uBlockLightCount, uBlockLights, uBlockLightColors;
+  let uVoxelLight, uVoxelLightReady, uLightVolumeOrigin, uLightVolumeSize;
   let shadowFbo=null, shadowDepthTexture=null, shadowSize=hasFinePointer?1024:512, shadowLightMVP=null;
 
   let state = 'title';
@@ -818,6 +821,8 @@ const EMBEDDED_CATEGORY_ICONS={'icon_Materials.png': './assets/images/acd9c23f5f
   let disableFovEffects = false;
   let shadersEnabled = false;
   let shadowDistance = 32;
+  let lightingPreference='auto',lightingBackend='cpu',lightingBackendReason='startup',lightingCpuMs=0,lightingGpuMs=0;
+  let voxelLightTexture=null,voxelLightReady=false,voxelLightRevision=0,voxelLightBuildToken=0,voxelLightTimer=0,voxelLightWorker=null;
   let weatherParticles = true;
   let localSplitOrientation = 'horizontal';
   let mobileLookSensitivity=100,pcLookSensitivity=100,controllerLookSensitivity=100;
@@ -1455,7 +1460,7 @@ function tradeRequirementStatus(m,offer){
     worldW=Number(result.worldW)||WORLD_W;worldD=Number(result.worldD)||WORLD_D;worldOriginX=Number(result.originX)||0;worldOriginZ=Number(result.originZ)||0;
     knownStructures=sanitizeDimensionStructures(Array.isArray(result.structures)?result.structures:knownStructures,currentDimension);
     if(!installWorkerMeshChunks(result.meshChunks))rebuildWorldMesh();ensureWorldMeshIntegrity();installWorkerBlockLights(result.lightBlocksBuffer||result.lightBlocks);
-    meshDirty=false;meshFullRebuildPending=false;dirtyMeshChunks.clear();worldLoaded=true;
+    meshDirty=false;meshFullRebuildPending=false;dirtyMeshChunks.clear();worldLoaded=true;scheduleVoxelLightRefresh(0,true);
     hydrateEntityBlocks(result.entityBlocksBuffer||result.entityBlocks);
     if(!generated)return;
     worldRevision=0;worldClock=.5;resetInventory();infiniteDeltas=Object.create(null);boats=[];mountedBoatId=null;nextBoatId=1;minecarts=[];mountedMinecartId=null;nextMinecartId=1;pistonAnimations=[];
@@ -1564,6 +1569,7 @@ function tradeRequirementStatus(m,offer){
       layout(location=0) in vec3 aPos;
       layout(location=1) in vec2 aUV;
       layout(location=2) in float aShade;
+      layout(location=3) in float aLocalSky;
       uniform mat4 uMVP;
       uniform vec3 uCam;
       uniform float uTime;
@@ -1571,6 +1577,7 @@ function tradeRequirementStatus(m,offer){
       uniform mat4 uLightMVP;
       out vec2 vUV;
       out float vShade;
+      out float vLocalSky;
       out float vDist;
       out vec4 vLightPos;
       out vec3 vWorldPos;
@@ -1580,12 +1587,14 @@ function tradeRequirementStatus(m,offer){
         gl_Position=uMVP*vec4(worldPos,1.0);
         vUV=aUV;
         vShade=aShade;
+        vLocalSky=aLocalSky;
         vDist=distance(worldPos,uCam);
         vLightPos=uLightMVP*vec4(worldPos,1.0);
         vWorldPos=worldPos;
       }`;
     const fs = `#version 300 es
       precision highp float;
+      precision highp sampler3D;
       uniform sampler2D uTexture;
       uniform float uAlpha;
       uniform float uAlphaCutoff;
@@ -1603,8 +1612,13 @@ function tradeRequirementStatus(m,offer){
       uniform int uBlockLightCount;
       uniform vec4 uBlockLights[24];
       uniform vec3 uBlockLightColors[24];
+      uniform sampler3D uVoxelLight;
+      uniform float uVoxelLightReady;
+      uniform vec3 uLightVolumeOrigin;
+      uniform vec3 uLightVolumeSize;
       in vec2 vUV;
       in float vShade;
+      in float vLocalSky;
       in float vDist;
       in vec4 vLightPos;
       in vec3 vWorldPos;
@@ -1617,23 +1631,37 @@ function tradeRequirementStatus(m,offer){
         for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){float depth=texture(uShadowMap,p.xy+vec2(x,y)*texel).r;visible+=(p.z-.0018<=depth)?1.0:.42;}
         return visible/9.0;
       }
+      vec2 voxelLightSample(){
+        if(uVoxelLightReady<.5)return vec2(clamp(vLocalSky,0.0,1.0),0.0);
+        vec3 cell=floor(vWorldPos);
+        vec3 uvw=vec3((cell.x-uLightVolumeOrigin.x+.5)/max(uLightVolumeSize.x,1.0),(cell.z-uLightVolumeOrigin.y+.5)/max(uLightVolumeSize.y,1.0),(cell.y-uLightVolumeOrigin.z+.5)/max(uLightVolumeSize.z,1.0));
+        if(any(lessThan(uvw,vec3(0.0)))||any(greaterThanEqual(uvw,vec3(1.0))))return vec2(clamp(vLocalSky,0.0,1.0),0.0);
+        return texture(uVoxelLight,uvw).rg;
+      }
       void main(){
         vec4 tex=texture(uTexture,vUV);
         if(tex.a<uAlphaCutoff) discard;
         tex.rgb*=uTint;
-        float daylight=.08+.92*clamp(uSkyLight,0.0,1.0);
+        vec2 voxelLight=voxelLightSample();
+        float localSky=clamp(uSkyLight,0.0,1.0)*clamp(voxelLight.r,0.0,1.0);
+        float daylight=.018+.982*localSky;
         vec3 blockLight=vec3(0.0);
-        for(int i=0;i<24;i++){
-          if(i>=uBlockLightCount)break;
-          float radius=max(uBlockLights[i].w,.01);
-          float distanceToLight=distance(vWorldPos,uBlockLights[i].xyz);
-          float attenuation=pow(clamp(1.0-distanceToLight/radius,0.0,1.0),2.0);
-          blockLight+=uBlockLightColors[i]*attenuation;
+        if(uVoxelLightReady>.5){
+          float blockStrength=pow(clamp(voxelLight.g,0.0,1.0),.72)*1.28;
+          blockLight=vec3(1.0,.72,.42)*blockStrength;
+        }else{
+          for(int i=0;i<24;i++){
+            if(i>=uBlockLightCount)break;
+            float radius=max(uBlockLights[i].w,.01);
+            float distanceToLight=distance(vWorldPos,uBlockLights[i].xyz);
+            float attenuation=pow(clamp(1.0-distanceToLight/radius,0.0,1.0),2.0);
+            blockLight+=uBlockLightColors[i]*attenuation;
+          }
         }
         vec3 illumination=vec3(daylight*sunShadow())+blockLight;
         vec3 lit=tex.rgb*vShade*clamp(illumination,vec3(0.0),vec3(1.8));
         // Keep texture detail readable without making night brighter than shaded daytime.
-        float textureFloor=.035+.105*clamp(uSkyLight,0.0,1.0);
+        float textureFloor=.018+.105*localSky;
         lit=max(lit,tex.rgb*textureFloor);
         if(uEnhanced>.5){
           lit=pow(max(lit,vec3(0.0)),vec3(.92));
@@ -1660,6 +1688,7 @@ function tradeRequirementStatus(m,offer){
     uTime = gl.getUniformLocation(program,'uTime');uWave=gl.getUniformLocation(program,'uWave');uLightMVP=gl.getUniformLocation(program,'uLightMVP');uShadowMap=gl.getUniformLocation(program,'uShadowMap');uUseShadows=gl.getUniformLocation(program,'uUseShadows');
     uSkyLight=gl.getUniformLocation(program,'uSkyLight');uEnhanced=gl.getUniformLocation(program,'uEnhanced');uUnderwater=gl.getUniformLocation(program,'uUnderwater');
     uBlockLightCount=gl.getUniformLocation(program,'uBlockLightCount');uBlockLights=gl.getUniformLocation(program,'uBlockLights[0]');uBlockLightColors=gl.getUniformLocation(program,'uBlockLightColors[0]');
+    uVoxelLight=gl.getUniformLocation(program,'uVoxelLight');uVoxelLightReady=gl.getUniformLocation(program,'uVoxelLightReady');uLightVolumeOrigin=gl.getUniformLocation(program,'uLightVolumeOrigin');uLightVolumeSize=gl.getUniformLocation(program,'uLightVolumeSize');
 
     vao = gl.createVertexArray();
     gl.bindVertexArray(vao);
@@ -1682,6 +1711,7 @@ function tradeRequirementStatus(m,offer){
       uniform mat4 uLightMVP;
       out vec2 vUV;
       out float vShade;
+      out float vLocalSky;
       out float vDist;
       out vec4 vLightPos;
       out vec3 vWorldPos;
@@ -1690,11 +1720,11 @@ function tradeRequirementStatus(m,offer){
         worldPos.x+=uWind*sin(uTime*1.35+aOffset.x*.73+aOffset.z*.41)*max(aPos.y,.0)*.025;
         worldPos.z+=uWind*cos(uTime*1.1+aOffset.z*.67)*max(aPos.y,.0)*.018;
         gl_Position=uMVP*vec4(worldPos,1.0);
-        vUV=aUV+vec2(aOffset.w*.28125,aOffset.w*-.25);vShade=aShade;vDist=distance(worldPos,uCam);vLightPos=uLightMVP*vec4(worldPos,1.0);vWorldPos=worldPos;
+        vUV=aUV+vec2(aOffset.w*.28125,aOffset.w*-.25);vShade=aShade;vLocalSky=1.0;vDist=distance(worldPos,uCam);vLightPos=uLightMVP*vec4(worldPos,1.0);vWorldPos=worldPos;
       }`;
     // Leaves need their own light response: the supplied leaf art is intentionally dark,
     // but foliage must still remain readable in daylight and next to lamps.
-    const leafFs=fs.replace('tex.rgb*=uTint;','tex.rgb*=uTint*vec3(1.85,2.28,1.72);').replace('float textureFloor=.035+.105*clamp(uSkyLight,0.0,1.0);','float textureFloor=.11+.17*clamp(uSkyLight,0.0,1.0);').replace('vec3 illumination=vec3(daylight*sunShadow())+blockLight;','vec3 illumination=vec3(daylight*max(sunShadow(),.66))+blockLight;');
+    const leafFs=fs.replace('tex.rgb*=uTint;','tex.rgb*=uTint*vec3(1.85,2.28,1.72);').replace('float textureFloor=.018+.105*localSky;','float textureFloor=.08+.13*localSky;').replace('vec3 illumination=vec3(daylight*sunShadow())+blockLight;','vec3 illumination=vec3(daylight*max(sunShadow(),.66))+blockLight;');
     leafProgram=createProgram(leafVs,leafFs);
     leafU={
       mvp:gl.getUniformLocation(leafProgram,'uMVP'),cam:gl.getUniformLocation(leafProgram,'uCam'),
@@ -1706,6 +1736,7 @@ function tradeRequirementStatus(m,offer){
       skyLight:gl.getUniformLocation(leafProgram,'uSkyLight'),enhanced:gl.getUniformLocation(leafProgram,'uEnhanced'),underwater:gl.getUniformLocation(leafProgram,'uUnderwater'),
       lightMVP:gl.getUniformLocation(leafProgram,'uLightMVP'),shadowMap:gl.getUniformLocation(leafProgram,'uShadowMap'),useShadows:gl.getUniformLocation(leafProgram,'uUseShadows'),
       blockLightCount:gl.getUniformLocation(leafProgram,'uBlockLightCount'),blockLights:gl.getUniformLocation(leafProgram,'uBlockLights[0]'),blockLightColors:gl.getUniformLocation(leafProgram,'uBlockLightColors[0]'),
+      voxelLight:gl.getUniformLocation(leafProgram,'uVoxelLight'),voxelLightReady:gl.getUniformLocation(leafProgram,'uVoxelLightReady'),lightVolumeOrigin:gl.getUniformLocation(leafProgram,'uLightVolumeOrigin'),lightVolumeSize:gl.getUniformLocation(leafProgram,'uLightVolumeSize'),
       tint:gl.getUniformLocation(leafProgram,'uTint')
     };
     leafVao=gl.createVertexArray();gl.bindVertexArray(leafVao);
@@ -1744,8 +1775,8 @@ function tradeRequirementStatus(m,offer){
     setupShadowMap();
     gl.enable(gl.DEPTH_TEST); gl.enable(gl.CULL_FACE); gl.cullFace(gl.BACK);
     gl.clearColor(.53,.66,.91,1);
-    gl.useProgram(program); gl.uniform1i(uTexture,0);gl.uniform1i(uShadowMap,1);gl.uniform1f(uUseShadows,0);gl.uniform1i(uBlockLightCount,0); gl.uniform1f(uAlphaCutoff,0.025); gl.uniform1f(uFogNear,28);gl.uniform1f(uFogFar,52);gl.uniform1f(uRedFlash,0);gl.uniform1f(uTime,0);gl.uniform1f(uWave,0);gl.uniform1f(uSkyLight,1);gl.uniform1f(uEnhanced,0);gl.uniform1f(uUnderwater,0);gl.uniformMatrix4fv(uLightMVP,false,new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]));
-    gl.useProgram(leafProgram);gl.uniform1i(leafU.texture,0);gl.uniform1i(leafU.shadowMap,1);gl.uniform1f(leafU.useShadows,0);gl.uniform1i(leafU.blockLightCount,0);gl.uniform3f(leafU.tint,1,1,1);gl.uniform1f(leafU.alpha,1);gl.uniform1f(leafU.cutoff,.5);gl.uniform1f(leafU.red,0);gl.uniform1f(leafU.time,0);gl.uniform1f(leafU.wind,0);gl.uniform1f(leafU.skyLight,1);gl.uniform1f(leafU.enhanced,0);gl.uniform1f(leafU.underwater,0);gl.uniformMatrix4fv(leafU.lightMVP,false,new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]));
+    gl.useProgram(program); gl.uniform1i(uTexture,0);gl.uniform1i(uShadowMap,1);gl.uniform1i(uVoxelLight,2);gl.uniform1f(uVoxelLightReady,0);gl.uniform3f(uLightVolumeOrigin,0,0,0);gl.uniform3f(uLightVolumeSize,1,1,1);gl.uniform1f(uUseShadows,0);gl.uniform1i(uBlockLightCount,0); gl.uniform1f(uAlphaCutoff,0.025); gl.uniform1f(uFogNear,28);gl.uniform1f(uFogFar,52);gl.uniform1f(uRedFlash,0);gl.uniform1f(uTime,0);gl.uniform1f(uWave,0);gl.uniform1f(uSkyLight,1);gl.uniform1f(uEnhanced,0);gl.uniform1f(uUnderwater,0);gl.uniformMatrix4fv(uLightMVP,false,new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]));
+    gl.useProgram(leafProgram);gl.uniform1i(leafU.texture,0);gl.uniform1i(leafU.shadowMap,1);gl.uniform1i(leafU.voxelLight,2);gl.uniform1f(leafU.voxelLightReady,0);gl.uniform3f(leafU.lightVolumeOrigin,0,0,0);gl.uniform3f(leafU.lightVolumeSize,1,1,1);gl.uniform1f(leafU.useShadows,0);gl.uniform1i(leafU.blockLightCount,0);gl.uniform3f(leafU.tint,1,1,1);gl.uniform1f(leafU.alpha,1);gl.uniform1f(leafU.cutoff,.5);gl.uniform1f(leafU.red,0);gl.uniform1f(leafU.time,0);gl.uniform1f(leafU.wind,0);gl.uniform1f(leafU.skyLight,1);gl.uniform1f(leafU.enhanced,0);gl.uniform1f(leafU.underwater,0);gl.uniformMatrix4fv(leafU.lightMVP,false,new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]));
     gl.useProgram(program);
   }
 
@@ -1763,6 +1794,16 @@ function tradeRequirementStatus(m,offer){
     gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,3,gl.FLOAT,false,stride,0);
     gl.enableVertexAttribArray(1);gl.vertexAttribPointer(1,2,gl.FLOAT,false,stride,3*4);
     gl.enableVertexAttribArray(2);gl.vertexAttribPointer(2,1,gl.FLOAT,false,stride,5*4);
+    gl.disableVertexAttribArray(3);gl.vertexAttribDivisor(3,0);gl.vertexAttrib1f(3,1);
+  }
+  const WORLD_VERTEX_FLOATS=7;
+  function configureWorldBuffer(buffer){
+    gl.bindBuffer(gl.ARRAY_BUFFER,buffer);
+    const stride=WORLD_VERTEX_FLOATS*4;
+    gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,3,gl.FLOAT,false,stride,0);
+    gl.enableVertexAttribArray(1);gl.vertexAttribPointer(1,2,gl.FLOAT,false,stride,3*4);
+    gl.enableVertexAttribArray(2);gl.vertexAttribPointer(2,1,gl.FLOAT,false,stride,5*4);
+    gl.enableVertexAttribArray(3);gl.vertexAttribDivisor(3,0);gl.vertexAttribPointer(3,1,gl.FLOAT,false,stride,6*4);
   }
 
   function createManualMipTexture(levels) {
@@ -1863,6 +1904,20 @@ function tradeRequirementStatus(m,offer){
     if(insideActive(x,y,z)){const index=localIndex(x,y,z);return nearbyDynamicLocalIndices.has(index)?BLOCK.AIR:world[index];}
     return getBlock(x,y,z);
   }
+  let skyLightCacheRevision=-1;const skyColumnBlockerCache=new Map(),skyFaceLevelCache=new Map();
+  function resetSkyLightCachesIfNeeded(){if(skyLightCacheRevision===worldRevision)return;skyLightCacheRevision=worldRevision;skyColumnBlockerCache.clear();skyFaceLevelCache.clear();}
+  function skyLightPassable(id){const d=BLOCK_BY_ID.get(id);return id===BLOCK.AIR||isFluid(id)||blockUsesAlpha(id)||!!d?.entityOnly||!!d?.passable;}
+  function skyColumnKey(x,z){return insideActive(x,0,z)?((z-worldOriginZ)*worldW+(x-worldOriginX)):`${x},${z}`;}
+  function skyCellKey(x,y,z){return insideActive(x,y,z)?localIndex(x,y,z):`${x},${y},${z}`;}
+  function highestSkyBlockerY(x,z){resetSkyLightCachesIfNeeded();const key=skyColumnKey(x,z);if(skyColumnBlockerCache.has(key))return skyColumnBlockerCache.get(key);let blocker=-1;for(let yy=WORLD_H-1;yy>=0;yy--){if(!skyLightPassable(getBlock(x,yy,z))){blocker=yy;break;}}skyColumnBlockerCache.set(key,blocker);return blocker;}
+  function directSkyAt(x,y,z){return currentDimension==='overworld'&&y>highestSkyBlockerY(x,z);}
+  function faceSkyLevel(x,y,z){
+    if(currentDimension!=='overworld')return 1;resetSkyLightCachesIfNeeded();if(y<0||y>=WORLD_H)return 1;const key=skyCellKey(x,y,z);if(skyFaceLevelCache.has(key))return skyFaceLevelCache.get(key);
+    if(!skyLightPassable(getBlock(x,y,z))){skyFaceLevelCache.set(key,0);return 0;}if(directSkyAt(x,y,z)){skyFaceLevelCache.set(key,1);return 1;}
+    const queue=[[x,y,z,0]],seen=new Set([key]),dirs=[[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];let result=0;
+    for(let qi=0;qi<queue.length;qi++){const[cx,cy,cz,d]=queue[qi];if(d>=3)continue;for(const dir of dirs){const nx=cx+dir[0],ny=cy+dir[1],nz=cz+dir[2],nd=d+1;if(ny<0||ny>=WORLD_H)continue;const nk=skyCellKey(nx,ny,nz);if(seen.has(nk)||!skyLightPassable(getBlock(nx,ny,nz)))continue;seen.add(nk);if(directSkyAt(nx,ny,nz)){result=(4-nd)/4;qi=queue.length;break;}queue.push([nx,ny,nz,nd]);}}
+    skyFaceLevelCache.set(key,result);return result;
+  }
   function blockLightStyle(id){
     const level=Number(BLOCK_BY_ID.get(id)?.light)||0;if(level<=0)return null;
     let color=[1.0,.72,.38];
@@ -1875,6 +1930,64 @@ function tradeRequirementStatus(m,offer){
     else if(id===BLOCK.MAGMA_BLOCK)color=[1.0,.28,.08];
     return{level,radius:4.5+level*.43,color};
   }
+
+  function voxelLightTables(){
+    const passableById=new Uint8Array(256),emissionById=new Uint8Array(256);
+    for(const [id,def] of BLOCK_BY_ID){if(id<0||id>=256)continue;passableById[id]=(!isOpaque(id)||id===BLOCK.AIR)?1:0;emissionById[id]=clamp(Math.round(Number(def?.light)||globalThis.DorukLighting?.emitterLevelForName?.(def?.name)||0),0,15);}
+    passableById[BLOCK.AIR]=1;
+    // Java-like source levels: ordinary torches are intentionally level 14, not a short-radius point light.
+    emissionById[BLOCK.TORCH]=14;emissionById[BLOCK.REDSTONE_TORCH]=7;emissionById[BLOCK.GLOWSTONE]=15;emissionById[BLOCK.LAVA]=15;emissionById[BLOCK.FIRE]=15;emissionById[BLOCK.JACK_O_LANTERN]=15;
+    return{passableById,emissionById};
+  }
+  function createVoxelLightingWorker(){
+    if(typeof globalThis.DorukCreateLightingWorker==='function')return globalThis.DorukCreateLightingWorker();
+    if(globalThis.DorukFileCompat?.active&&globalThis.DorukFileCompat.createLightingWorker)return globalThis.DorukFileCompat.createLightingWorker();
+    try{return new Worker('./lighting-worker.js');}catch{return null;}
+  }
+  function computeVoxelLightCPUAsync(options){
+    return new Promise((resolve,reject)=>{
+      const worker=createVoxelLightingWorker();
+      if(!worker){try{return resolve(globalThis.DorukLighting.computeCPU(options));}catch(error){return reject(error);}}
+      voxelLightWorker=worker;let done=false;const finish=(fn,value)=>{if(done)return;done=true;try{worker.terminate();}catch{}if(voxelLightWorker===worker)voxelLightWorker=null;fn(value);};
+      worker.onmessage=e=>{const d=e.data||{};if(!d.ok)return finish(reject,new Error(d.error||'CPU lighting worker failed'));finish(resolve,{rg:new Uint8Array(d.rgBuffer),width:d.width,height:d.height,depth:d.depth,backend:'cpu'});};
+      worker.onerror=e=>finish(reject,new Error(e.message||'CPU lighting worker failed'));
+      const worldBuffer=options.world.slice().buffer,passableBuffer=options.passableById.slice().buffer,emissionBuffer=options.emissionById.slice().buffer;
+      worker.postMessage({worldBuffer,passableBuffer,emissionBuffer,width:options.width,height:options.height,depth:options.depth,dimension:options.dimension},[worldBuffer,passableBuffer,emissionBuffer]);
+    });
+  }
+  function uploadVoxelLightTexture(result){
+    if(!gl||!result?.rg||result.rg.length!==worldW*worldD*WORLD_H*2)return false;
+    if(!voxelLightTexture)voxelLightTexture=gl.createTexture();
+    gl.activeTexture(gl.TEXTURE2);gl.bindTexture(gl.TEXTURE_3D,voxelLightTexture);gl.pixelStorei(gl.UNPACK_ALIGNMENT,1);
+    gl.texParameteri(gl.TEXTURE_3D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);gl.texParameteri(gl.TEXTURE_3D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);gl.texParameteri(gl.TEXTURE_3D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_3D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_3D,gl.TEXTURE_WRAP_R,gl.CLAMP_TO_EDGE);
+    // Array layout is X,Z,Y, so texture dimensions are width=worldW, height=worldD, depth=WORLD_H.
+    gl.texImage3D(gl.TEXTURE_3D,0,gl.RG8,worldW,worldD,WORLD_H,0,gl.RG,gl.UNSIGNED_BYTE,result.rg);gl.activeTexture(gl.TEXTURE0);
+    voxelLightReady=true;voxelLightRevision++;return true;
+  }
+  function applyVoxelLightUniforms(target='main'){
+    if(!gl)return;const ready=voxelLightReady&&!!voxelLightTexture;
+    gl.activeTexture(gl.TEXTURE2);gl.bindTexture(gl.TEXTURE_3D,ready?voxelLightTexture:null);gl.activeTexture(gl.TEXTURE0);
+    if(target==='leaf'&&leafU){gl.uniform1i(leafU.voxelLight,2);gl.uniform1f(leafU.voxelLightReady,ready?1:0);gl.uniform3f(leafU.lightVolumeOrigin,worldOriginX,worldOriginZ,0);gl.uniform3f(leafU.lightVolumeSize,worldW,worldD,WORLD_H);}
+    else{gl.uniform1i(uVoxelLight,2);gl.uniform1f(uVoxelLightReady,ready?1:0);gl.uniform3f(uLightVolumeOrigin,worldOriginX,worldOriginZ,0);gl.uniform3f(uLightVolumeSize,worldW,worldD,WORLD_H);}
+  }
+  function lightingBackendLabel(){return lightingBackend==='gpu'?'GPU / WebGPU compute':'CPU / Worker';}
+  function updateLightingEngineUI(){
+    if(lightingEngineBtn){const labels={auto:'Auto (Recommended)',cpu:'CPU / WebGL2',gpu:'GPU / WebGPU'};lightingEngineBtn.textContent=`Lighting Engine: ${labels[lightingPreference]||labels.auto}`;}
+    if(lightingEngineStatus){let extra='';if(lightingBackendReason==='benchmark'&&lightingCpuMs&&Number.isFinite(lightingGpuMs))extra=` • CPU ${lightingCpuMs.toFixed(1)}ms / GPU ${lightingGpuMs.toFixed(1)}ms`;lightingEngineStatus.textContent=`Active: ${lightingBackendLabel()}${extra}`;}
+  }
+  async function rebuildVoxelLighting({reselect=false,quiet=true}={}){
+    if(!worldLoaded||!gl||!globalThis.DorukLighting)return false;const token=++voxelLightBuildToken,{passableById,emissionById}=voxelLightTables(),options={world,width:worldW,height:WORLD_H,depth:worldD,dimension:currentDimension,passableById,emissionById};
+    try{
+      const choice=await globalThis.DorukLighting.chooseBackend(lightingPreference);if(token!==voxelLightBuildToken)return false;lightingBackend=choice.backend;lightingBackendReason=choice.reason||'selected';lightingCpuMs=Number(choice.cpuMs)||0;lightingGpuMs=Number(choice.gpuMs)||0;updateLightingEngineUI();
+      let result;if(lightingBackend==='gpu'){try{result=await globalThis.DorukLighting.computeGPU(options);}catch(error){console.warn('WebGPU lighting failed; falling back to CPU worker.',error);lightingBackend='cpu';lightingBackendReason='gpu-fallback';result=await computeVoxelLightCPUAsync(options);}}
+      else result=await computeVoxelLightCPUAsync(options);
+      if(token!==voxelLightBuildToken)return false;uploadVoxelLightTexture(result);updateLightingEngineUI();if(!quiet)showToast(`Lighting: ${lightingBackendLabel()}`);return true;
+    }catch(error){console.warn('Voxel lighting rebuild failed; legacy lights remain active.',error);voxelLightReady=false;updateLightingEngineUI();return false;}
+  }
+  function scheduleVoxelLightRefresh(delay=110,resetVolume=false){
+    if(resetVolume)voxelLightReady=false;clearTimeout(voxelLightTimer);voxelLightTimer=setTimeout(()=>{voxelLightTimer=0;rebuildVoxelLighting({quiet:true});},Math.max(0,delay));
+  }
+  async function cycleLightingEngine(){const order=['auto','cpu','gpu'],i=order.indexOf(lightingPreference);lightingPreference=order[(i+1)%order.length];voxelLightReady=false;updateLightingEngineUI();saveSettings();await rebuildVoxelLighting({reselect:true,quiet:false});}
   const blockLightSpatialKey=(x,z)=>`${Math.floor(x/CHUNK_SIZE)},${Math.floor(z/CHUNK_SIZE)}`;
   function addBlockLightSpatial(key,source){const sk=blockLightSpatialKey(source.x,source.z);let set=blockLightSpatial.get(sk);if(!set){set=new Set();blockLightSpatial.set(sk,set);}set.add(key);}
   function removeBlockLightSpatial(key,source){if(!source)return;const sk=blockLightSpatialKey(source.x,source.z),set=blockLightSpatial.get(sk);if(!set)return;set.delete(key);if(!set.size)blockLightSpatial.delete(sk);}
@@ -1950,7 +2063,7 @@ function tradeRequirementStatus(m,offer){
     // 16×200×16 rescan: buildWorldMeshChunk reuses the previous shell and revisits only
     // the edited neighbourhood, including the new block and the faces it may occlude.
     markBlockMeshDirty(x,z,y);
-    updateBlockLightAt(x,y,z,v);worldRevision++;
+    updateBlockLightAt(x,y,z,v);worldRevision++;scheduleVoxelLightRefresh(90);
     if(v!==BLOCK.DOOR)openDoors.delete(deltaKey(x,y,z));
     if(previous!==v&&blockEntities[key]?.id!==v)delete blockEntities[key];
     if(v===BLOCK.AIR)delete blockEntities[key];
@@ -2158,6 +2271,7 @@ function tradeRequirementStatus(m,offer){
   function blockTile(block,kind,x=null,z=null){const d=BLOCK_BY_ID.get(block);if(!d)return[0,0];if(block===BLOCK.GRASS&&Number.isFinite(x)&&Number.isFinite(z)&&biomeAt(x,z)>.78){if(kind==='top')return[29,0];if(kind!=='bottom')return[30,0];}return d.all||d[kind]||d.side||d.top;}
   function tileUV(tile){const[x,y]=tile,pad=.5,size=16,w=512,h=256;return[(x*size+pad)/w,(y*size+pad)/h,((x+1)*size-pad)/w,((y+1)*size-pad)/h];}
   function pushQuad(arr,verts,uv,shade,ox=0,oy=0,oz=0,quarterTurns=0){const[u0,v0,u1,v1]=uv,base=[[u0,v1],[u0,v0],[u1,v0],[u1,v1]],q=quarterTurns&3,uvv=q?base.map((_,i)=>base[(i+q)&3]):base,order=[0,1,2,0,2,3];for(const i of order){const p=verts[i],t=uvv[i];arr.push(p[0]+ox,p[1]+oy,p[2]+oz,t[0],t[1],shade);}}
+  function pushWorldQuad(arr,verts,uv,shade,sky,ox=0,oy=0,oz=0,quarterTurns=0){const[u0,v0,u1,v1]=uv,base=[[u0,v1],[u0,v0],[u1,v0],[u1,v1]],q=quarterTurns&3,uvv=q?base.map((_,i)=>base[(i+q)&3]):base,order=[0,1,2,0,2,3];for(const i of order){const p=verts[i],t=uvv[i];arr.push(p[0]+ox,p[1]+oy,p[2]+oz,t[0],t[1],shade,sky);}}
 
   // These blocks use vanilla-like non-cube model heights. Their source side textures
   // intentionally leave transparent pixels at the top, so crop that unused strip and
@@ -2200,6 +2314,7 @@ function tradeRequirementStatus(m,offer){
     const planes=[[[0,0,0],[0,1,0],[1,1,1],[1,0,1]],[[1,0,0],[1,1,0],[0,1,1],[0,0,1]],[[0,.5,0],[0,.5,1],[1,.5,1],[1,.5,0]]];
     for(const plane of planes){pushQuad(arr,plane,uv,1,x,y,z);pushQuad(arr,[plane[3],plane[2],plane[1],plane[0]],uv,1,x,y,z);}
   }
+  function pushWorldCobwebMesh(arr,x,y,z){const uv=tileUV(blockTile(BLOCK.COBWEB,'all')),sky=faceSkyLevel(x,y,z),planes=[[[0,0,0],[0,1,0],[1,1,1],[1,0,1]],[[1,0,0],[1,1,0],[0,1,1],[0,0,1]],[[0,.5,0],[0,.5,1],[1,.5,1],[1,.5,0]]];for(const plane of planes){pushWorldQuad(arr,plane,uv,1,sky,x,y,z);pushWorldQuad(arr,[plane[3],plane[2],plane[1],plane[0]],uv,1,sky,x,y,z);}}
 
   const meshChunkKey=(cx,cz)=>`${cx},${cz}`;
   function meshChunkIntersectsWorld(cx,cz){
@@ -2279,19 +2394,19 @@ function tradeRequirementStatus(m,offer){
         if(isFluid(b))visible=n!==b&&(f.kind==='top'||n===BLOCK.AIR||BLOCK_BY_ID.get(n)?.passable);
         else if(alpha)visible=n!==b&&(!isOpaque(n)||n===BLOCK.AIR);
         else visible=n===BLOCK.AIR||isFluid(n)||blockUsesAlpha(n)||BLOCK_BY_ID.get(n)?.entityOnly;
-        if(visible)pushQuad(target,faceVertsForBlock(b,f),faceUVForBlock(b,f,x,z,y),f.shade,x,y,z,seededTextureQuarterTurn(b,f.kind,x,y,z));
+        if(visible)pushWorldQuad(target,faceVertsForBlock(b,f),faceUVForBlock(b,f,x,z,y),f.shade,faceSkyLevel(x+f.d[0],y+f.d[1],z+f.d[2]),x,y,z,seededTextureQuarterTurn(b,f.kind,x,y,z));
       }
     }
     dynamicEditMesh={solid,cutouts,water};dynamicEditMeshDirty=false;
   }
-  function drawDynamicEditLayer(kind,mvp,camPos){if(dynamicEditMeshDirty)rebuildDynamicEditMesh();const data=dynamicEditMesh[kind]||[];if(data.length)drawDynamic(data,entityBuffer,terrainTexture,mvp,camPos,kind==='water'?.72:1,1,0);}
+  function drawDynamicEditLayer(kind,mvp,camPos){if(dynamicEditMeshDirty)rebuildDynamicEditMesh();const data=dynamicEditMesh[kind]||[];if(data.length)drawDynamicWorld(data,entityBuffer,terrainTexture,mvp,camPos,kind==='water'?.72:1,1,0);}
   function markAllMeshesDirty(){meshFullRebuildPending=true;dirtyMeshChunks.clear();meshDirty=true;}
   function deleteWorldMeshChunk(chunk){if(!gl||!chunk)return;for(const key of['solidBuffer','leafBuffer','leafInstanceBuffer','waterBuffer'])if(chunk[key])gl.deleteBuffer(chunk[key]);}
   function clearWorldMeshChunks(){for(const chunk of worldMeshChunks.values())deleteWorldMeshChunk(chunk);worldMeshChunks.clear();meshShellSeedsByChunk.clear();}
   function uploadChunkArray(existing,values){const data=values instanceof Float32Array?values:new Float32Array(values||[]),buffer=existing||gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buffer);gl.bufferData(gl.ARRAY_BUFFER,data,gl.STATIC_DRAW);return{buffer,count:data.length};}
   function setWorldMeshChunk(cx,cz,mesh){
     const key=meshChunkKey(cx,cz),previous=worldMeshChunks.get(key)||{},solid=uploadChunkArray(previous.solidBuffer,mesh.solid),cutouts=uploadChunkArray(previous.leafBuffer,mesh.cutouts),leaves=uploadChunkArray(previous.leafInstanceBuffer,mesh.leafInstances),water=uploadChunkArray(previous.waterBuffer,mesh.water),shell=mesh.shell instanceof Int32Array?mesh.shell:new Int32Array(mesh.shell||previous.shell||[]);
-    worldMeshChunks.set(key,{cx,cz,solidBuffer:solid.buffer,solidCount:solid.count/6,leafBuffer:cutouts.buffer,leafCount:cutouts.count/6,leafInstanceBuffer:leaves.buffer,leafInstanceCount:leaves.count/4,waterBuffer:water.buffer,waterCount:water.count/6,shell});
+    worldMeshChunks.set(key,{cx,cz,solidBuffer:solid.buffer,solidCount:solid.count/WORLD_VERTEX_FLOATS,leafBuffer:cutouts.buffer,leafCount:cutouts.count/WORLD_VERTEX_FLOATS,leafInstanceBuffer:leaves.buffer,leafInstanceCount:leaves.count/4,waterBuffer:water.buffer,waterCount:water.count/WORLD_VERTEX_FLOATS,shell});
   }
   function installWorkerMeshChunks(rows){
     if(!Array.isArray(rows)||!rows.length)return false;clearWorldMeshChunks();
@@ -2382,7 +2497,7 @@ function tradeRequirementStatus(m,offer){
     nearbyDynamicLocalIndices.clear();dynamicEditChunkX=dynamicEditChunkZ=Number.NaN;
     world=new Uint8Array(result.worldBuffer);worldW=Number(result.worldW)||WORLD_W;worldD=Number(result.worldD)||WORLD_D;worldOriginX=Number(result.originX)||0;worldOriginZ=Number(result.originZ)||0;
     for(const key of nearbyDynamicBlocks){const[x,y,z]=key.split(',').map(Number);if(insideActive(x,y,z))nearbyDynamicLocalIndices.add(localIndex(x,y,z));}
-    knownStructures=Array.isArray(result.structures)?result.structures:knownStructures;worldLoaded=true;installWorkerBlockLights(result.lightBlocksBuffer||result.lightBlocks);hydrateEntityBlocks(result.entityBlocksBuffer||result.entityBlocks);
+    knownStructures=Array.isArray(result.structures)?result.structures:knownStructures;worldLoaded=true;scheduleVoxelLightRefresh(0,true);installWorkerBlockLights(result.lightBlocksBuffer||result.lightBlocks);hydrateEntityBlocks(result.entityBlocksBuffer||result.entityBlocks);
     const install=await installStreamingWorkerMeshChunks(result.meshChunks,revisionAtStart);if(install===null){installWorkerMeshChunks(result.meshChunks);return{uploadedKeys:new Set(),aborted:false};}
     meshFullRebuildPending=false;return install;
   }
@@ -2393,13 +2508,13 @@ function tradeRequirementStatus(m,offer){
     const processBlock=(x,y,z)=>{
       const b=meshBlockAt(x,y,z);if(b===BLOCK.AIR||BLOCK_BY_ID.get(b)?.entityOnly)return;
       if(b===BLOCK.LEAVES){leafPositions.push(x,y,z,biomeAt(x,z)>.78?1:0);addShell(x,y,z);return;}
-      if(b===BLOCK.COBWEB){pushCobwebMesh(cutouts,x,y,z);addShell(x,y,z);return;}
+      if(b===BLOCK.COBWEB){pushWorldCobwebMesh(cutouts,x,y,z);addShell(x,y,z);return;}
       const alpha=blockUsesAlpha(b),target=isFluid(b)?water:(alpha?cutouts:solid);
       for(const f of FACE_DATA){const n=meshBlockAt(x+f.d[0],y+f.d[1],z+f.d[2]);let visible=false;
         if(isFluid(b))visible=n!==b&&(f.kind==='top'||n===BLOCK.AIR||BLOCK_BY_ID.get(n)?.passable);
         else if(alpha)visible=n!==b&&(!isOpaque(n)||n===BLOCK.AIR);
         else visible=n===BLOCK.AIR||isFluid(n)||blockUsesAlpha(n)||BLOCK_BY_ID.get(n)?.entityOnly;
-        if(visible){pushQuad(target,faceVertsForBlock(b,f),faceUVForBlock(b,f,x,z,y),f.shade,x,y,z,seededTextureQuarterTurn(b,f.kind,x,y,z));addShell(x,y,z);addShell(x-f.d[0],y-f.d[1],z-f.d[2]);addShell(x-f.d[0]*2,y-f.d[1]*2,z-f.d[2]*2);}
+        if(visible){pushWorldQuad(target,faceVertsForBlock(b,f),faceUVForBlock(b,f,x,z,y),f.shade,faceSkyLevel(x+f.d[0],y+f.d[1],z+f.d[2]),x,y,z,seededTextureQuarterTurn(b,f.kind,x,y,z));addShell(x,y,z);addShell(x-f.d[0],y-f.d[1],z-f.d[2]);addShell(x-f.d[0]*2,y-f.d[1]*2,z-f.d[2]*2);}
       }
     };
     if(baseShell||seedSet){
@@ -3915,12 +4030,12 @@ ${gameMode[0].toUpperCase()+gameMode.slice(1)} • ${difficulty[0].toUpperCase()
     const underwater=!!player.underwater,fogColor=underwater?[.055,.22,.34]:sky.color;
     const normalFogFar=worldType==='infinite'?renderDistance*CHUNK_SIZE*1.35:78,fogFar=underwater?12:normalFogFar,fogNear=underwater?1.8:Math.max(24,fogFar*.58),time=performance.now()/1000;
     const useShadows=!!(shadersEnabled&&shadowLightMVP&&currentDimension==='overworld');
-    gl.useProgram(program);gl.uniformMatrix4fv(uMVP,false,mvp);gl.uniformMatrix4fv(uLightMVP,false,shadowLightMVP||mvp);gl.uniform1f(uUseShadows,useShadows?1:0);gl.uniform3fv(uCam,cam.pos);gl.uniform3fv(uFogColor,fogColor);gl.uniform1f(uFogNear,fogNear);gl.uniform1f(uFogFar,fogFar);gl.uniform1f(uTime,time);gl.uniform1f(uWave,0);gl.uniform1f(uSkyLight,sky.light);gl.uniform1f(uEnhanced,shadersEnabled?1:0);gl.uniform1f(uUnderwater,underwater?1:0);gl.uniform3f(uTint,1,1,1);uploadBlockLightUniforms(uBlockLightCount,uBlockLights,uBlockLightColors,cam.pos);gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,shadowDepthTexture);gl.activeTexture(gl.TEXTURE0);gl.bindVertexArray(vao);
+    gl.useProgram(program);applyVoxelLightUniforms('main');gl.uniformMatrix4fv(uMVP,false,mvp);gl.uniformMatrix4fv(uLightMVP,false,shadowLightMVP||mvp);gl.uniform1f(uUseShadows,useShadows?1:0);gl.uniform3fv(uCam,cam.pos);gl.uniform3fv(uFogColor,fogColor);gl.uniform1f(uFogNear,fogNear);gl.uniform1f(uFogFar,fogFar);gl.uniform1f(uTime,time);gl.uniform1f(uWave,0);gl.uniform1f(uSkyLight,sky.light);gl.uniform1f(uEnhanced,shadersEnabled?1:0);gl.uniform1f(uUnderwater,underwater?1:0);gl.uniform3f(uTint,1,1,1);uploadBlockLightUniforms(uBlockLightCount,uBlockLights,uBlockLightColors,cam.pos);gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,shadowDepthTexture);gl.activeTexture(gl.TEXTURE0);gl.bindVertexArray(vao);
     if(!underwater)drawSky(mvp,cam,sky);
     gl.enable(gl.DEPTH_TEST);gl.enable(gl.CULL_FACE);gl.disable(gl.BLEND);gl.depthMask(true);gl.uniform1f(uFogMix,1);gl.uniform1f(uRedFlash,0);gl.bindTexture(gl.TEXTURE_2D,terrainTexture);
     gl.uniform1f(uAlpha,1);gl.uniform1f(uAlphaCutoff,.025);drawLitWorldMeshLayer('solidBuffer','solidCount',cam.pos);drawDynamicEditLayer('solid',mvp,cam.pos);
     drawInstancedLeaves(mvp,cam.pos,fogColor,fogNear,fogFar,sky.light,underwater,time);
-    gl.useProgram(program);gl.uniformMatrix4fv(uMVP,false,mvp);gl.uniformMatrix4fv(uLightMVP,false,shadowLightMVP||mvp);gl.uniform1f(uUseShadows,useShadows?1:0);gl.uniform3fv(uCam,cam.pos);gl.uniform3fv(uFogColor,fogColor);gl.uniform1f(uFogNear,fogNear);gl.uniform1f(uFogFar,fogFar);gl.uniform1f(uFogMix,1);gl.uniform1f(uRedFlash,0);gl.uniform1f(uTime,time);gl.uniform1f(uWave,0);gl.uniform1f(uSkyLight,sky.light);gl.uniform1f(uEnhanced,shadersEnabled?1:0);gl.uniform1f(uUnderwater,underwater?1:0);gl.uniform3f(uTint,1,1,1);uploadBlockLightUniforms(uBlockLightCount,uBlockLights,uBlockLightColors,cam.pos);gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,shadowDepthTexture);gl.activeTexture(gl.TEXTURE0);gl.bindVertexArray(vao);gl.bindTexture(gl.TEXTURE_2D,terrainTexture);
+    gl.useProgram(program);applyVoxelLightUniforms('main');gl.uniformMatrix4fv(uMVP,false,mvp);gl.uniformMatrix4fv(uLightMVP,false,shadowLightMVP||mvp);gl.uniform1f(uUseShadows,useShadows?1:0);gl.uniform3fv(uCam,cam.pos);gl.uniform3fv(uFogColor,fogColor);gl.uniform1f(uFogNear,fogNear);gl.uniform1f(uFogFar,fogFar);gl.uniform1f(uFogMix,1);gl.uniform1f(uRedFlash,0);gl.uniform1f(uTime,time);gl.uniform1f(uWave,0);gl.uniform1f(uSkyLight,sky.light);gl.uniform1f(uEnhanced,shadersEnabled?1:0);gl.uniform1f(uUnderwater,underwater?1:0);gl.uniform3f(uTint,1,1,1);uploadBlockLightUniforms(uBlockLightCount,uBlockLights,uBlockLightColors,cam.pos);gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,shadowDepthTexture);gl.activeTexture(gl.TEXTURE0);gl.bindVertexArray(vao);gl.bindTexture(gl.TEXTURE_2D,terrainTexture);
     gl.uniform1f(uAlpha,1);gl.uniform1f(uAlphaCutoff,.5);drawLitWorldMeshLayer('leafBuffer','leafCount',cam.pos);drawDynamicEditLayer('cutouts',mvp,cam.pos);drawRedstoneWires(mvp,cam.pos);drawEndPortalSurfaces(mvp,cam.pos);
     gl.uniform1f(uAlphaCutoff,.025);drawSimpleShadows(mvp,cam.pos);drawEntities(mvp,cam.pos);drawBellModels(mvp,cam.pos);drawDroppedItems(mvp,cam);drawProjectilesAndParticles(mvp,cam);drawBreakOverlay(mvp,cam.pos);
     gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.depthMask(false);gl.bindTexture(gl.TEXTURE_2D,terrainTexture);gl.uniform1f(uFogMix,1);gl.uniform1f(uRedFlash,0);gl.uniform1f(uAlpha,underwater?.42:.72);gl.uniform1f(uAlphaCutoff,.025);gl.uniform1f(uWave,shadersEnabled?1:0);drawLitWorldMeshLayer('waterBuffer','waterCount',cam.pos);drawDynamicEditLayer('water',mvp,cam.pos);gl.uniform1f(uWave,0);gl.depthMask(true);gl.disable(gl.BLEND);gl.bindVertexArray(null);
@@ -3941,7 +4056,7 @@ ${gameMode[0].toUpperCase()+gameMode.slice(1)} • ${difficulty[0].toUpperCase()
   function drawViewModel(aspect,eyeOffset=0){
     gl.clear(gl.DEPTH_BUFFER_BIT);gl.enable(gl.DEPTH_TEST);gl.disable(gl.BLEND);gl.disable(gl.CULL_FACE);gl.depthMask(true);gl.useProgram(program);gl.activeTexture(gl.TEXTURE0);
     // The first-person model is a HUD object: keep it readable even with custom skins at night.
-    gl.uniform1f(uUseShadows,0);gl.uniform1f(uSkyLight,1);gl.uniform1f(uEnhanced,0);gl.uniform1f(uUnderwater,0);gl.uniform1i(uBlockLightCount,0);gl.uniform1f(uTime,0);gl.uniform1f(uWave,0);gl.uniform3fv(uFogColor,[0,0,0]);gl.uniform1f(uFogMix,0);gl.uniform1f(uAlpha,1);gl.uniform1f(uAlphaCutoff,.08);gl.uniform1f(uRedFlash,0);
+    gl.uniform1f(uVoxelLightReady,0);gl.uniform1f(uUseShadows,0);gl.uniform1f(uSkyLight,1);gl.uniform1f(uEnhanced,0);gl.uniform1f(uUnderwater,0);gl.uniform1i(uBlockLightCount,0);gl.uniform1f(uTime,0);gl.uniform1f(uWave,0);gl.uniform3fv(uFogColor,[0,0,0]);gl.uniform1f(uFogMix,0);gl.uniform1f(uAlpha,1);gl.uniform1f(uAlphaCutoff,.08);gl.uniform1f(uRedFlash,0);
     const proj=mat4Perspective(58*DEG,aspect,.015,8),view=mat4LookAt([eyeOffset,0,0],[eyeOffset,0,-1],[0,1,0]),mvp=mat4Multiply(proj,view),walk=player.moving?player.walkTime:0,bobX=Math.sin(walk)*.025,bobY=Math.abs(Math.cos(walk))*.02;
     const action=handSwingAmount(),down=action*.34,sweepLeft=action*.20,rot=action*.78;
     const main=selectedContent(),off=CONTENT_BY_ID.get(offhandId)||null;
@@ -3961,18 +4076,18 @@ ${gameMode[0].toUpperCase()+gameMode.slice(1)} • ${difficulty[0].toUpperCase()
     gl.enable(gl.CULL_FACE);gl.uniform1f(uAlphaCutoff,.025);
   }
 
-  function drawWorldMeshLayer(bufferKey,countKey){for(const chunk of worldMeshChunks.values())if(chunk[countKey]>0){configureBuffer(chunk[bufferKey]);gl.drawArrays(gl.TRIANGLES,0,chunk[countKey]);}}
+  function drawWorldMeshLayer(bufferKey,countKey){for(const chunk of worldMeshChunks.values())if(chunk[countKey]>0){configureWorldBuffer(chunk[bufferKey]);gl.drawArrays(gl.TRIANGLES,0,chunk[countKey]);}}
   function drawLitWorldMeshLayer(bufferKey,countKey,camPos){
     if(inputMode==='touch'){
       // One light-uniform upload per layer on mobile instead of one per visible chunk.
       uploadBlockLightUniforms(uBlockLightCount,uBlockLights,uBlockLightColors,camPos);
-      for(const chunk of worldMeshChunks.values())if(chunk[countKey]>0){configureBuffer(chunk[bufferKey]);gl.drawArrays(gl.TRIANGLES,0,chunk[countKey]);}
+      for(const chunk of worldMeshChunks.values())if(chunk[countKey]>0){configureWorldBuffer(chunk[bufferKey]);gl.drawArrays(gl.TRIANGLES,0,chunk[countKey]);}
       return;
     }
     for(const chunk of worldMeshChunks.values())if(chunk[countKey]>0){
       const lightProbe=[chunk.cx*CHUNK_SIZE+CHUNK_SIZE*.5,camPos[1],chunk.cz*CHUNK_SIZE+CHUNK_SIZE*.5];
       uploadBlockLightUniforms(uBlockLightCount,uBlockLights,uBlockLightColors,lightProbe,`chunk:${chunk.cx},${chunk.cz}`);
-      configureBuffer(chunk[bufferKey]);gl.drawArrays(gl.TRIANGLES,0,chunk[countKey]);
+      configureWorldBuffer(chunk[bufferKey]);gl.drawArrays(gl.TRIANGLES,0,chunk[countKey]);
     }
     uploadBlockLightUniforms(uBlockLightCount,uBlockLights,uBlockLightColors,camPos);
   }
@@ -3980,7 +4095,7 @@ ${gameMode[0].toUpperCase()+gameMode.slice(1)} • ${difficulty[0].toUpperCase()
   function drawInstancedLeaves(mvp,camPos,fogColor,fogNear,fogFar,skyLight,underwater,time){
     if(!leafProgram)return;
     let hasLeaves=false;for(const chunk of worldMeshChunks.values())if(chunk.leafInstanceCount>0){hasLeaves=true;break;}if(!hasLeaves)return;
-    const useShadows=!!(shadersEnabled&&shadowLightMVP&&currentDimension==='overworld');gl.useProgram(leafProgram);gl.uniformMatrix4fv(leafU.mvp,false,mvp);gl.uniformMatrix4fv(leafU.lightMVP,false,shadowLightMVP||mvp);gl.uniform1f(leafU.useShadows,useShadows?1:0);gl.uniform3fv(leafU.cam,camPos);gl.uniform3fv(leafU.fogColor,fogColor);
+    const useShadows=!!(shadersEnabled&&shadowLightMVP&&currentDimension==='overworld');gl.useProgram(leafProgram);applyVoxelLightUniforms('leaf');gl.uniformMatrix4fv(leafU.mvp,false,mvp);gl.uniformMatrix4fv(leafU.lightMVP,false,shadowLightMVP||mvp);gl.uniform1f(leafU.useShadows,useShadows?1:0);gl.uniform3fv(leafU.cam,camPos);gl.uniform3fv(leafU.fogColor,fogColor);
     gl.uniform1f(leafU.alpha,1);gl.uniform1f(leafU.cutoff,.5);gl.uniform3f(leafU.tint,1,1,1);gl.uniform1f(leafU.fogMix,1);gl.uniform1f(leafU.fogNear,fogNear);gl.uniform1f(leafU.fogFar,fogFar);gl.uniform1f(leafU.red,0);gl.uniform1f(leafU.time,time);gl.uniform1f(leafU.wind,shadersEnabled?1:0);gl.uniform1f(leafU.skyLight,skyLight);gl.uniform1f(leafU.enhanced,shadersEnabled?1:0);gl.uniform1f(leafU.underwater,underwater?1:0);
     gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,shadowDepthTexture);gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,terrainTexture);gl.bindVertexArray(leafVao);
     if(inputMode==='touch'){
@@ -4269,6 +4384,7 @@ ${gameMode[0].toUpperCase()+gameMode.slice(1)} • ${difficulty[0].toUpperCase()
   }
 
   function drawDynamic(data,buffer,tex,mvp,camPos,alpha=1,fogMix=1,redFlash=0,tint=null){if(!data.length)return;uploadBuffer(buffer,new Float32Array(data));gl.uniformMatrix4fv(uMVP,false,mvp);gl.uniform3fv(uCam,camPos);gl.uniform1f(uAlpha,alpha);gl.uniform1f(uFogMix,fogMix);gl.uniform1f(uRedFlash,redFlash);if(tint)gl.uniform3fv(uTint,tint);else gl.uniform3f(uTint,1,1,1);gl.bindTexture(gl.TEXTURE_2D,tex);configureBuffer(buffer);gl.drawArrays(gl.TRIANGLES,0,data.length/6);}
+  function drawDynamicWorld(data,buffer,tex,mvp,camPos,alpha=1,fogMix=1,redFlash=0){if(!data.length)return;uploadBuffer(buffer,new Float32Array(data));gl.uniformMatrix4fv(uMVP,false,mvp);gl.uniform3fv(uCam,camPos);gl.uniform1f(uAlpha,alpha);gl.uniform1f(uFogMix,fogMix);gl.uniform1f(uRedFlash,redFlash);gl.uniform3f(uTint,1,1,1);gl.bindTexture(gl.TEXTURE_2D,tex);configureWorldBuffer(buffer);gl.drawArrays(gl.TRIANGLES,0,data.length/WORLD_VERTEX_FLOATS);}
 
   function buildHumanoid(out,x,y,z,yaw,phase,type,pose={}) {
     const zombieLike=type==='zombie'||type==='boulder_zombie'||type==='lobber_zombie';
@@ -5129,7 +5245,7 @@ ${gameMode[0].toUpperCase()+gameMode.slice(1)} • ${difficulty[0].toUpperCase()
     updateDifficultyUI();updateVRSetting();renderDistance=clamp(Math.round(Number(renderDistance)||3),2,6);baseFov=clamp(Math.round(Number(baseFov)||70),50,100);
     if(renderDistanceSlider)renderDistanceSlider.value=String(renderDistance);if(renderDistanceValue)renderDistanceValue.textContent=`${renderDistance} chunk radius (${renderDistance*2+1}×${renderDistance*2+1})`;
     if(fovSlider)fovSlider.value=String(baseFov);if(fovValue)fovValue.textContent=`${baseFov}°`;if(fovEffectsBtn)fovEffectsBtn.textContent=`${disableFovEffects?'☑':'☐'} Disable FOV Effects`;
-    if(shadersBtn)shadersBtn.textContent=`${shadersEnabled?'☑':'☐'} Enhanced Shaders + Sun Shadows`;if(shadowDistanceSlider)shadowDistanceSlider.value=String(shadowDistance);if(shadowDistanceValue)shadowDistanceValue.textContent=`${shadowDistance} blocks`;if($('weatherParticlesBtn'))$('weatherParticlesBtn').textContent=`${weatherParticles?'☑':'☐'} Weather Particles`;shaderWarning?.classList.toggle('hidden',!shadersEnabled);document.body.classList.toggle('shaders-on',shadersEnabled);
+    if(shadersBtn)shadersBtn.textContent=`${shadersEnabled?'☑':'☐'} Enhanced Shaders + Sun Shadows`;if(shadowDistanceSlider)shadowDistanceSlider.value=String(shadowDistance);if(shadowDistanceValue)shadowDistanceValue.textContent=`${shadowDistance} blocks`;if($('weatherParticlesBtn'))$('weatherParticlesBtn').textContent=`${weatherParticles?'☑':'☐'} Weather Particles`;shaderWarning?.classList.toggle('hidden',!shadersEnabled);document.body.classList.toggle('shaders-on',shadersEnabled);updateLightingEngineUI();
   }
   function changeRenderDistance(value,stream=true){renderDistance=clamp(Math.round(Number(value)||3),2,6);updateRenderSettings();saveSettings();if(stream&&worldType==='infinite'&&state==='playing')requestInfiniteChunks(true);}
   function changeFov(value){baseFov=clamp(Math.round(Number(value)||70),50,100);if(disableFovEffects||!sprinting)currentFov=baseFov;updateRenderSettings();saveSettings();}
@@ -5427,11 +5543,11 @@ ${gameMode[0].toUpperCase()+gameMode.slice(1)} • ${difficulty[0].toUpperCase()
       resetMobs();droppedItems=Array.isArray(data.droppedItems)?data.droppedItems.filter(d=>CONTENT_BY_ID.has(Number(d.id))).slice(0,128).map(d=>{const st=validStack(d)||{id:Number(d.id),count:1};return{...st,x:Number(d.x)||0,y:(Number(d.y)||1)+(legacyOverworldShift&&currentDimension==='overworld'?legacyOverworldShift:0),z:Number(d.z)||0,vx:Number(d.vx)||0,vy:Number(d.vy)||0,vz:Number(d.vz)||0,age:Number(d.age)||0,spin:Number(d.spin)||0};}):[];placeMobsNearPlayer();loadedSaveWorldHeight=WORLD_H;markAllMeshesDirty();renderEffects();updateVitals(true);updateHotbar();updateModeUI();return true;
     }catch(e){console.warn(e);deletePersistedWorld();return false;}
   }
-  function saveSettings(){localStorage.setItem(SETTINGS_KEY,JSON.stringify({character,activeCharacterId,customSkinModel,logoStyle,touchControlMode,touchSettings,thirdPerson,thirdPersonFront,renderDistance,baseFov,disableFovEffects,shadersEnabled,shadowDistance,weatherParticles,gameRules,difficulty,vrEnabled:false,multiplayerName:multiplayerName?.value||'Player',usernameUserEdited,localSplitOrientation,mobileLookSensitivity,pcLookSensitivity,controllerLookSensitivity}));}
+  function saveSettings(){localStorage.setItem(SETTINGS_KEY,JSON.stringify({character,activeCharacterId,customSkinModel,logoStyle,touchControlMode,touchSettings,thirdPerson,thirdPersonFront,renderDistance,baseFov,disableFovEffects,shadersEnabled,shadowDistance,lightingPreference,weatherParticles,gameRules,difficulty,vrEnabled:false,multiplayerName:multiplayerName?.value||'Player',usernameUserEdited,localSplitOrientation,mobileLookSensitivity,pcLookSensitivity,controllerLookSensitivity}));}
   function loadSettings(){
     try{
       const raw=localStorage.getItem(SETTINGS_KEY)||localStorage.getItem('dorukcraft-unengined-settings-v011')||localStorage.getItem('dorukcraft-unengined-settings-v010')||localStorage.getItem('dorukcraft-unengined-settings-v05')||localStorage.getItem('dorukcraft-unengined-settings-v04')||localStorage.getItem('dorukcraft-unengined-settings-v03')||localStorage.getItem('dorukcraft-unengined-settings-v02')||'{}',data=JSON.parse(raw);
-      character=['Steven','Alexa','Custom'].includes(data.character)?data.character:'Steven';activeCharacterId=typeof data.activeCharacterId==='string'?data.activeCharacterId:(character==='Alexa'?'alexa':'steven');customSkinModel=data.customSkinModel==='slim'?'slim':'classic';logoStyle=typeof data.logoStyle==='string'?data.logoStyle:'DorukCraft';touchControlMode=data.touchControlMode==='joystick'?'joystick':'arrows';touchSettings={...touchSettings,...(data.touchSettings||{})};thirdPerson=!!data.thirdPerson;thirdPersonFront=thirdPerson&&!!data.thirdPersonFront;renderDistance=clamp(Math.round(Number(data.renderDistance)||3),2,6);baseFov=clamp(Math.round(Number(data.baseFov)||70),50,100);currentFov=baseFov;disableFovEffects=!!data.disableFovEffects;shadersEnabled=!!data.shadersEnabled;shadowDistance=clamp(Math.round(Number(data.shadowDistance)||32),16,48);weatherParticles=data.weatherParticles!==false;gameRules={...gameRules,...(data.gameRules||{})};difficulty=DIFFICULTIES.includes(data.difficulty)?data.difficulty:'normal';pendingDifficulty=difficulty;vrEnabled=false;usernameUserEdited=!!data.usernameUserEdited;const savedUser=String(data.multiplayerName||'').trim().slice(0,24),stationUser=dorukStationProfileName();if(multiplayerName)multiplayerName.value=((stationUser&&!usernameUserEdited)?stationUser:(savedUser||stationUser||'Player')).slice(0,24);localSplitOrientation=data.localSplitOrientation==='vertical'?'vertical':'horizontal';mobileLookSensitivity=clamp(Math.round(Number(data.mobileLookSensitivity)||100),25,200);pcLookSensitivity=clamp(Math.round(Number(data.pcLookSensitivity)||100),25,200);controllerLookSensitivity=clamp(Math.round(Number(data.controllerLookSensitivity)||100),25,200);updateDorukStationProfileStatus();updateInputSettingsUI();
+      character=['Steven','Alexa','Custom'].includes(data.character)?data.character:'Steven';activeCharacterId=typeof data.activeCharacterId==='string'?data.activeCharacterId:(character==='Alexa'?'alexa':'steven');customSkinModel=data.customSkinModel==='slim'?'slim':'classic';logoStyle=typeof data.logoStyle==='string'?data.logoStyle:'DorukCraft';touchControlMode=data.touchControlMode==='joystick'?'joystick':'arrows';touchSettings={...touchSettings,...(data.touchSettings||{})};thirdPerson=!!data.thirdPerson;thirdPersonFront=thirdPerson&&!!data.thirdPersonFront;renderDistance=clamp(Math.round(Number(data.renderDistance)||3),2,6);baseFov=clamp(Math.round(Number(data.baseFov)||70),50,100);currentFov=baseFov;disableFovEffects=!!data.disableFovEffects;shadersEnabled=!!data.shadersEnabled;shadowDistance=clamp(Math.round(Number(data.shadowDistance)||32),16,48);lightingPreference=['auto','cpu','gpu'].includes(data.lightingPreference)?data.lightingPreference:'auto';weatherParticles=data.weatherParticles!==false;gameRules={...gameRules,...(data.gameRules||{})};difficulty=DIFFICULTIES.includes(data.difficulty)?data.difficulty:'normal';pendingDifficulty=difficulty;vrEnabled=false;usernameUserEdited=!!data.usernameUserEdited;const savedUser=String(data.multiplayerName||'').trim().slice(0,24),stationUser=dorukStationProfileName();if(multiplayerName)multiplayerName.value=((stationUser&&!usernameUserEdited)?stationUser:(savedUser||stationUser||'Player')).slice(0,24);localSplitOrientation=data.localSplitOrientation==='vertical'?'vertical':'horizontal';mobileLookSensitivity=clamp(Math.round(Number(data.mobileLookSensitivity)||100),25,200);pcLookSensitivity=clamp(Math.round(Number(data.pcLookSensitivity)||100),25,200);controllerLookSensitivity=clamp(Math.round(Number(data.controllerLookSensitivity)||100),25,200);updateDorukStationProfileStatus();updateInputSettingsUI();
     }catch{if(multiplayerName)multiplayerName.value=dorukStationProfileName()||'Player';mobileLookSensitivity=pcLookSensitivity=controllerLookSensitivity=100;updateDorukStationProfileStatus();updateInputSettingsUI();}
   }
   async function applyResourcePack(pack){
@@ -5942,6 +6058,7 @@ ${gameMode[0].toUpperCase()+gameMode.slice(1)} • ${difficulty[0].toUpperCase()
   fovSlider?.addEventListener('input',()=>changeFov(fovSlider.value));
   fovEffectsBtn.onclick=toggleFovEffects;
   shadersBtn.onclick=toggleShaders;
+  if(lightingEngineBtn)lightingEngineBtn.onclick=cycleLightingEngine;
   $('daylightRuleBtn').onclick=()=>toggleGameRule('doDaylightCycle','Daylight Cycle');
   $('weatherRuleBtn').onclick=()=>toggleGameRule('doWeatherCycle','Weather Cycle');
   $('mobGriefRuleBtn').onclick=()=>toggleGameRule('mobGriefing','Mob Griefing');
